@@ -7,22 +7,40 @@
 #        gh cut check --changelog <tag>
 #        gh cut notes <version>
 #
-# <version> is bare (0.1.8, not v0.1.8). --dry-run runs every check and
-# prints each mutating command instead of running it.
+# <version> is bare (0.1.8, not v0.1.8) and may carry a prerelease suffix
+# (1.0.0-rc.1), which marks the GitHub release as a prerelease. --dry-run runs
+# every check, against the bumped tree, and prints each mutating command
+# instead of running it.
 #
-# The bump goes through a squash-merged PR, not a push to main: GitHub signs
-# the squash commit, and the main ruleset requires a PR. If the version on
-# main already reads <version>, the PR steps are skipped and only the tag and
-# release are created.
+# The bump goes through a PR to the default branch, not a push: GitHub signs
+# the squash commit, and a ruleset can require a PR. If the version on the
+# default branch already reads <version>, the PR steps are skipped and only the
+# tag and release are created.
 #
-# The repository supplies scripts/release-hooks.sh, which defines:
+# The repository may supply scripts/release-hooks.sh, which defines:
 #   release_version        print the current version; fail if files disagree
 #   release_bump VERSION   write VERSION into every versioned file
 #   release_checks         run the gates that must pass before a release
-# Hooks run with the repository root as the working directory. The hooks file
-# may also set RELEASE_BY_WORKFLOW=1 when a workflow creates the GitHub release
-# from the pushed tag.
+# release_version and release_bump are defined together or not at all; without
+# them the tag is the version and no bump PR is made. release_checks defaults
+# to a no-op. Hooks run with the repository root as the working directory. The
+# hooks file may also set RELEASE_BY_WORKFLOW=1 when a workflow creates the
+# GitHub release from the pushed tag.
+#
+# CHANGELOG.md headings may read "## X.Y.Z" or "## [X.Y.Z] - date".
 set -eu
+
+readonly VERSION_PATTERN='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+
+# Headings are compared as strings, never as a pattern built from the version.
+readonly CHANGELOG_AWK_LIB='
+  function heading_version(line) {
+    line = substr(line, 4)
+    if (substr(line, 1, 1) == "[") line = substr(line, 2)
+    sub(/[] ].*$/, "", line)
+    return line
+  }
+'
 
 _run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -32,31 +50,47 @@ _run() {
   fi
 }
 
+# command -v prints a bare name only for functions and builtins; a PATH
+# executable prints its path.
+_is_hook_defined() {
+  [ "$(command -v "$1" 2>/dev/null)" = "$1" ]
+}
+
 _load_hooks() {
   _load_hooks_file="$REPO_ROOT/scripts/release-hooks.sh"
-  if [ ! -f "$_load_hooks_file" ]; then
-    echo "gh-cut: $_load_hooks_file not found" >&2
+  RELEASE_BY_WORKFLOW=0
+  release_checks() { :; }
+  if [ -f "$_load_hooks_file" ]; then
+    # shellcheck disable=SC1090 # path is repository-supplied
+    . "$_load_hooks_file"
+  fi
+  _load_hooks_has_version=0
+  _load_hooks_has_bump=0
+  if _is_hook_defined release_version; then
+    _load_hooks_has_version=1
+  fi
+  if _is_hook_defined release_bump; then
+    _load_hooks_has_bump=1
+  fi
+  if [ "$_load_hooks_has_version" -ne "$_load_hooks_has_bump" ]; then
+    echo "gh-cut: $_load_hooks_file must define both release_version and release_bump, or neither" >&2
     exit 1
   fi
-  RELEASE_BY_WORKFLOW=0
-  # shellcheck disable=SC1090 # path is repository-supplied
-  . "$_load_hooks_file"
-  for _load_hooks_name in release_version release_bump release_checks; do
-    if ! command -v "$_load_hooks_name" >/dev/null 2>&1; then
-      echo "gh-cut: $_load_hooks_file does not define $_load_hooks_name" >&2
-      exit 1
-    fi
-  done
+  VERSIONED=$_load_hooks_has_version
+  readonly VERSIONED
 }
 
 _check_tag_shape() {
-  if ! printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "gh-cut: tag '$1' does not match vX.Y.Z" >&2
+  if ! printf '%s\n' "$1" | grep -Eq "^v$VERSION_PATTERN\$"; then
+    echo "gh-cut: tag '$1' does not match vX.Y.Z or vX.Y.Z-prerelease" >&2
     return 1
   fi
 }
 
 _check_tag_matches_version() {
+  if [ "$VERSIONED" -eq 0 ]; then
+    return 0
+  fi
   _check_tag_matches_version_current=$(release_version) || {
     echo "gh-cut: could not read a consistent version" >&2
     return 1
@@ -76,17 +110,23 @@ _check_title_matches_tag() {
 
 _check_changelog_heading() {
   _check_changelog_heading_version=${1#v}
-  if ! grep -Fxq "## $_check_changelog_heading_version" "$CHANGELOG"; then
-    echo "gh-cut: CHANGELOG.md has no '## $_check_changelog_heading_version' heading" >&2
+  if ! CUT_VERSION=$_check_changelog_heading_version awk "$CHANGELOG_AWK_LIB"'
+    /^## / && heading_version($0) == ENVIRON["CUT_VERSION"] { found = 1 }
+    END { exit (found ? 0 : 1) }
+  ' "$CHANGELOG"; then
+    echo "gh-cut: CHANGELOG.md has no heading for $_check_changelog_heading_version" >&2
     return 1
   fi
 }
 
 _print_notes() {
   _check_changelog_heading "$1" || return 1
-  awk -v ver="## $1" '
-    $0 == ver { found = 1; next }
-    found && /^## / { exit }
+  CUT_VERSION=${1#v} awk "$CHANGELOG_AWK_LIB"'
+    /^## / {
+      if (found) exit
+      if (heading_version($0) == ENVIRON["CUT_VERSION"]) found = 1
+      next
+    }
     found { print }
   ' "$CHANGELOG"
 }
@@ -106,12 +146,45 @@ _check_release() {
   return "$_check_release_status"
 }
 
+_print_usage() {
+  echo "usage: gh cut [--dry-run] <version>"
+  echo "       gh cut check <tag> [<title>]"
+  echo "       gh cut check --changelog <tag>"
+  echo "       gh cut notes <version>"
+}
+
 _usage() {
-  echo "usage: gh cut [--dry-run] <version>" >&2
-  echo "       gh cut check <tag> [<title>]" >&2
-  echo "       gh cut check --changelog <tag>" >&2
-  echo "       gh cut notes <version>" >&2
+  _print_usage >&2
   exit 2
+}
+
+_pick_merge_flag() {
+  if [ "$1" = true ]; then
+    echo "--squash"
+  elif [ "$2" = true ]; then
+    echo "--merge"
+  elif [ "$3" = true ]; then
+    echo "--rebase"
+  else
+    echo "gh-cut: repository allows no merge method" >&2
+    return 1
+  fi
+}
+
+_load_repo_settings() {
+  _load_repo_settings_row=$(gh repo view \
+    --json defaultBranchRef,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed \
+    --jq '[.defaultBranchRef.name, .squashMergeAllowed, .mergeCommitAllowed, .rebaseMergeAllowed] | @tsv') || {
+    echo "gh-cut: could not read repository settings" >&2
+    exit 1
+  }
+  IFS=$(printf '\t') read -r DEFAULT_BRANCH _load_repo_settings_squash \
+    _load_repo_settings_merge _load_repo_settings_rebase <<EOF
+$_load_repo_settings_row
+EOF
+  MERGE_FLAG=$(_pick_merge_flag "$_load_repo_settings_squash" \
+    "$_load_repo_settings_merge" "$_load_repo_settings_rebase") || exit 1
+  readonly DEFAULT_BRANCH MERGE_FLAG
 }
 
 _remote_ref_exists() {
@@ -148,35 +221,45 @@ _parse_args() {
   if [ -z "$VERSION" ]; then
     _usage
   fi
-  if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "gh-cut: version '$VERSION' does not match X.Y.Z" >&2
+  if ! printf '%s\n' "$VERSION" | grep -Eq "^$VERSION_PATTERN\$"; then
+    echo "gh-cut: version '$VERSION' does not match X.Y.Z or X.Y.Z-prerelease" >&2
     exit 1
   fi
   TAG="v$VERSION"
   BRANCH="release-$VERSION"
-  readonly DRY_RUN VERSION TAG BRANCH
+  PRERELEASE=0
+  case $VERSION in
+    *-*) PRERELEASE=1 ;;
+  esac
+  readonly DRY_RUN VERSION TAG BRANCH PRERELEASE
+}
+
+_require_clean_tree() {
+  _require_clean_tree_status=$(git -C "$REPO_ROOT" status --porcelain)
+  if [ -n "$_require_clean_tree_status" ]; then
+    echo "gh-cut: worktree is not clean:" >&2
+    printf '%s\n' "$_require_clean_tree_status" >&2
+    exit 1
+  fi
 }
 
 _check_preconditions() {
   _check_changelog_heading "$TAG"
 
   _check_preconditions_branch=$(git -C "$REPO_ROOT" branch --show-current)
-  if [ "$_check_preconditions_branch" != "main" ]; then
-    echo "gh-cut: must be on main, not '$_check_preconditions_branch'" >&2
+  if [ "$_check_preconditions_branch" != "$DEFAULT_BRANCH" ]; then
+    echo "gh-cut: must be on $DEFAULT_BRANCH, not '$_check_preconditions_branch'" >&2
     exit 1
   fi
 
-  if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-    echo "gh-cut: worktree is not clean" >&2
-    exit 1
-  fi
+  _require_clean_tree
 
-  git -C "$REPO_ROOT" fetch origin main
+  git -C "$REPO_ROOT" fetch origin "$DEFAULT_BRANCH"
 
-  _check_preconditions_local=$(git -C "$REPO_ROOT" rev-parse main)
-  _check_preconditions_remote=$(git -C "$REPO_ROOT" rev-parse origin/main)
+  _check_preconditions_local=$(git -C "$REPO_ROOT" rev-parse "$DEFAULT_BRANCH")
+  _check_preconditions_remote=$(git -C "$REPO_ROOT" rev-parse "origin/$DEFAULT_BRANCH")
   if [ "$_check_preconditions_local" != "$_check_preconditions_remote" ]; then
-    echo "gh-cut: main has diverged from origin/main" >&2
+    echo "gh-cut: $DEFAULT_BRANCH has diverged from origin/$DEFAULT_BRANCH" >&2
     exit 1
   fi
 
@@ -207,50 +290,52 @@ _check_branch_absent() {
   fi
 }
 
+_require_no_untracked() {
+  _require_no_untracked_files=$(git -C "$REPO_ROOT" status --porcelain | grep '^??' || true)
+  if [ -n "$_require_no_untracked_files" ]; then
+    echo "gh-cut: release_bump left untracked files:" >&2
+    printf '%s\n' "$_require_no_untracked_files" >&2
+    exit 1
+  fi
+}
+
 _is_bumped() {
+  if [ "$VERSIONED" -eq 0 ]; then
+    return 0
+  fi
   _is_bumped_current=$(release_version) || return 1
   [ "$_is_bumped_current" = "$VERSION" ]
 }
 
-# A dry run applies the bump so the real gate runs against it, then discards
-# every change; the worktree is clean on entry.
-_dry_run_check() {
-  trap 'git -C "$REPO_ROOT" checkout -- .' EXIT
-  trap 'exit 130' INT TERM
-  release_bump "$VERSION"
-  _dry_run_check_status=0
-  _check_release "$TAG" "$TAG" || _dry_run_check_status=$?
-  git -C "$REPO_ROOT" checkout -- .
-  trap - EXIT INT TERM
-  return "$_dry_run_check_status"
-}
-
-_run_release_check() {
-  if [ "$DRY_RUN" -eq 1 ] && ! _is_bumped; then
-    _dry_run_check
-  else
-    _check_release "$TAG" "$TAG"
-  fi
-}
-
-_run_gates() {
+_verify_release() {
+  _check_release "$TAG" "$TAG"
   release_checks
 }
 
-_commit_and_push_branch() {
+# A dry run discards the bump before printing the commands that would commit
+# it, so only the files the bump left behind remain for _require_clean_tree.
+_commit_bump() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "+ release_bump $VERSION"
+    git -C "$REPO_ROOT" checkout -- .
+  fi
+  _run git -C "$REPO_ROOT" switch -c "$BRANCH"
   _run git -C "$REPO_ROOT" add -u
   _run git -C "$REPO_ROOT" commit -m "Release $VERSION"
+}
+
+_push_branch() {
   _run git -C "$REPO_ROOT" push -u origin "$BRANCH"
-  _run git -C "$REPO_ROOT" switch main
+  _run git -C "$REPO_ROOT" switch "$DEFAULT_BRANCH"
 }
 
 _open_pr() {
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "+ gh pr create --base main --head $BRANCH --title 'Release $VERSION'" >&2
+    echo "+ gh pr create --base $DEFAULT_BRANCH --head $BRANCH --title 'Release $VERSION'" >&2
     echo "<pr-url>"
     return
   fi
-  gh pr create --base main --head "$BRANCH" --title "Release $VERSION" \
+  gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "Release $VERSION" \
     --body "Version bump for $VERSION; gh cut tags and releases after merge."
 }
 
@@ -281,38 +366,38 @@ _merge_pr() {
   # --match-head-commit refuses to merge if the branch moved during the wait.
   # No --admin: bypassing the ruleset is what leaves the commit unsigned.
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "+ gh pr merge $_merge_pr_pr_url --squash --delete-branch --match-head-commit <branch-head>"
+    echo "+ gh pr merge $_merge_pr_pr_url $MERGE_FLAG --delete-branch --match-head-commit <branch-head>"
     return
   fi
-  gh pr merge "$_merge_pr_pr_url" --squash --delete-branch \
+  gh pr merge "$_merge_pr_pr_url" "$MERGE_FLAG" --delete-branch \
     --match-head-commit "$(git -C "$REPO_ROOT" rev-parse "$BRANCH")"
 }
 
 _sync_main() {
   _sync_main_pr_url=$1
-  _run git -C "$REPO_ROOT" pull --ff-only origin main
+  _run git -C "$REPO_ROOT" pull --ff-only origin "$DEFAULT_BRANCH"
   if [ "$DRY_RUN" -eq 1 ]; then
     return
   fi
   # Tags go on HEAD, so HEAD must be the merge commit, not a later push.
   _sync_main_merged=$(gh pr view "$_sync_main_pr_url" --json mergeCommit --jq .mergeCommit.oid)
   if [ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != "$_sync_main_merged" ]; then
-    echo "gh-cut: main moved past the release commit $_sync_main_merged" >&2
+    echo "gh-cut: $DEFAULT_BRANCH moved past the release commit $_sync_main_merged" >&2
     exit 1
   fi
 }
 
 _land_bump() {
   _check_branch_absent
-  _run git -C "$REPO_ROOT" switch -c "$BRANCH"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "+ release_bump $VERSION"
-  else
-    release_bump "$VERSION"
-  fi
-  _run_release_check
-  _run_gates
-  _commit_and_push_branch
+  trap 'git -C "$REPO_ROOT" checkout -- .' EXIT
+  trap 'exit 130' INT TERM
+  release_bump "$VERSION"
+  _require_no_untracked
+  _verify_release
+  _commit_bump
+  trap - EXIT INT TERM
+  _require_clean_tree
+  _push_branch
   _land_bump_pr_url=$(_open_pr)
   _await_checks "$_land_bump_pr_url"
   _merge_pr "$_land_bump_pr_url"
@@ -329,22 +414,31 @@ _create_github_release() {
     return
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "+ gh release create $TAG --title $TAG --notes-file <## $VERSION CHANGELOG section>"
-    return
+    _create_github_release_notes="<## $VERSION CHANGELOG section>"
+  else
+    _create_github_release_notes=$(mktemp "${TMPDIR:-/tmp}/gh-cut-notes.XXXXXX")
+    trap 'rm -f "$_create_github_release_notes"' EXIT
+    trap 'exit 130' INT TERM
+    _print_notes "$VERSION" >"$_create_github_release_notes"
   fi
-  _create_github_release_notes=$(mktemp "${TMPDIR:-/tmp}/gh-cut-notes.XXXXXX")
-  trap 'rm -f "$_create_github_release_notes"' EXIT
-  _print_notes "$VERSION" >"$_create_github_release_notes"
-  gh release create "$TAG" --title "$TAG" --notes-file "$_create_github_release_notes"
-  rm -f "$_create_github_release_notes"
-  trap - EXIT
+  set -- "$TAG" --title "$TAG" --notes-file "$_create_github_release_notes" --verify-tag
+  if [ "$PRERELEASE" -eq 1 ]; then
+    set -- "$@" --prerelease
+  fi
+  _run gh release create "$@"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    rm -f "$_create_github_release_notes"
+    trap - EXIT INT TERM
+  fi
 }
 
 _cut() {
   _parse_args "$@"
+  _load_hooks
+  _load_repo_settings
   _check_preconditions
   if _is_bumped; then
-    _run_release_check
+    _verify_release
   else
     _land_bump
   fi
@@ -352,26 +446,39 @@ _cut() {
   _create_github_release
 }
 
-main() {
+_check() {
+  if [ $# -eq 2 ] && [ "$1" = "--changelog" ]; then
+    _check_changelog_heading "$2"
+  elif [ $# -eq 1 ] || [ $# -eq 2 ]; then
+    _load_hooks
+    _check_release "$@"
+  else
+    _usage
+  fi
+}
+
+_enter_repo() {
   REPO_ROOT=$(git rev-parse --show-toplevel)
   readonly REPO_ROOT
   cd "$REPO_ROOT"
   readonly CHANGELOG="$REPO_ROOT/CHANGELOG.md"
-  _load_hooks
+}
 
+main() {
   if [ $# -eq 0 ]; then
     _usage
   fi
   case $1 in
+    -h | --help)
+      _print_usage
+      return
+      ;;
+  esac
+  _enter_repo
+  case $1 in
     check)
       shift
-      if [ $# -eq 2 ] && [ "$1" = "--changelog" ]; then
-        _check_changelog_heading "$2"
-      elif [ $# -eq 1 ] || [ $# -eq 2 ]; then
-        _check_release "$@"
-      else
-        _usage
-      fi
+      _check "$@"
       ;;
     notes)
       if [ $# -ne 2 ]; then
